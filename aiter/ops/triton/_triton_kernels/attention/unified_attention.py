@@ -238,7 +238,8 @@ def kernel_unified_attention_2d(
     if k_descale_ptr is not None and v_descale_ptr is not None:
         k_descale = tl.load(k_descale_ptr)
         v_descale = tl.load(v_descale_ptr)
-        qk_scale = qk_scale * k_descale
+        if q_descale:
+            qk_scale = qk_scale * k_descale
     else:
         k_descale = None
         v_descale = None
@@ -278,7 +279,13 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        if K_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                K = K_load
+            else:
+                K = (K_load.to(tl.float32) * k_descale).to(Q.dtype)
+        else:
+            K = K_load
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -288,7 +295,13 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        if V_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                V = V_load
+            else:
+                V = (V_load.to(tl.float32) * v_descale).to(Q.dtype)
+        else:
+            V = V_load
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -357,7 +370,7 @@ def kernel_unified_attention_2d(
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
-    if v_descale is not None:
+    if q_descale:
         one_over_L = v_descale / L[:, None]
     else:
         one_over_L = 1.0 / L[:, None]
@@ -554,7 +567,8 @@ def kernel_unified_attention_3d(
     if k_descale_ptr is not None and v_descale_ptr is not None:
         k_descale = tl.load(k_descale_ptr)
         v_descale = tl.load(v_descale_ptr)
-        qk_scale = qk_scale * k_descale
+        if q_descale:
+            qk_scale = qk_scale * k_descale
     else:
         k_descale = None
         v_descale = None
@@ -596,7 +610,13 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        K = K_load.to(Q.dtype)
+        if K_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                K = K_load
+            else:
+                K = (K_load.to(tl.float32) * k_descale).to(Q.dtype)
+        else:
+            K = K_load
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -606,7 +626,13 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        V = V_load.to(Q.dtype)
+        if V_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                V = V_load
+            else:
+                V = (V_load.to(tl.float32) * v_descale).to(Q.dtype)
+        else:
+            V = V_load
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
@@ -674,7 +700,7 @@ def kernel_unified_attention_3d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
-    if v_descale is not None:
+    if q_descale:
         acc = acc * v_descale
 
     segm_output_offset = (
