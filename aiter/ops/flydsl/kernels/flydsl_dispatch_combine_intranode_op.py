@@ -366,13 +366,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # Dispatch (encode) and combine (decode, Stage 3) must agree on this.
         self._effective_max_recv = config.effective_max_recv
 
-        self._disp_jit_cache: Dict[Tuple[torch.dtype, int, int], Any] = {}
-        self._disp_compiled_cache: Dict[Tuple[torch.dtype, int, int], Any] = {}
+        self._disp_jit_cache: Dict[Tuple[torch.dtype, int, int, int], Any] = {}
+        self._disp_compiled_cache: Dict[Tuple[torch.dtype, int, int, int], Any] = {}
         self._comb_jit_cache: Dict[
-            Tuple[torch.dtype, bool, bool, bool, int, int], Any
+            Tuple[torch.dtype, bool, bool, bool, int, int, int], Any
         ] = {}
         self._comb_compiled_cache: Dict[
-            Tuple[torch.dtype, bool, bool, bool, int, int], Any
+            Tuple[torch.dtype, bool, bool, bool, int, int, int], Any
         ] = {}
 
         # Start at 1: a zero flag would satisfy the first wait and skip the sync.
@@ -455,11 +455,14 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
 
-        # shmem_malloc is uninitialized; zero what combine reads.
+        # shmem_malloc is uninitialized. recv_tok_num and tok_off are dispatch
+        # protocol sentinels/counters and must start at zero on a reused heap.
         self.shmem_tok_id_to_src.zero_()
         self.shmem_comb_inp_tok.zero_()
         self.shmem_comb_inp_wts.zero_()
         self.shmem_xdev_bar_mem.zero_()
+        self.shmem_recv_tok_num.zero_()
+        self.shmem_tok_off.zero_()
 
         self.dest_pe_ctr = torch.zeros(npes, dtype=torch.int32, device=self._dev)
         self.disp_bar = torch.zeros(1, dtype=torch.int32, device=self._dev)
@@ -827,8 +830,30 @@ class FlyDSLDispatchCombineIntraNodeOp:
                     "packed_recv_x is only consumed when cfg.enable_std_moe=True"
                 )
 
-    def _get_dispatch_jit(self, d_dtype, block_num, warp_num_per_block):
-        key = (d_dtype, block_num, warp_num_per_block)
+    def _resolve_recv_cap(self, recv_cap, who):
+        """Resolve a per-call total receive-slot cap.
+
+        Physical shmem remains allocated at ``effective_max_recv``. A smaller
+        cap specializes dispatch/combine indexing and the returned recv views;
+        both kernels must use the same value because ``dest_tok_map`` encodes
+        recv slots with this stride.
+        """
+        physical_cap = self._effective_max_recv
+        if recv_cap is None:
+            return physical_cap
+        if not isinstance(recv_cap, int):
+            raise TypeError(
+                f"{who} recv_cap must be an int, got {type(recv_cap).__name__}"
+            )
+        if recv_cap <= 0 or recv_cap > physical_cap:
+            raise ValueError(
+                f"{who} recv_cap={recv_cap} out of range "
+                f"[1, effective_max_recv={physical_cap}]"
+            )
+        return recv_cap
+
+    def _get_dispatch_jit(self, d_dtype, block_num, warp_num_per_block, recv_cap):
+        key = (d_dtype, block_num, warp_num_per_block, recv_cap)
         if key not in self._disp_jit_cache:
             cfg = self.cfg
             self._disp_jit_cache[key] = make_dispatch_jit(
@@ -844,7 +869,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_dim=cfg.scale_dim,
                 scale_type_size=cfg.scale_type_size,
                 enable_std_moe=cfg.enable_std_moe,
-                max_recv=self._effective_max_recv,
+                max_recv=recv_cap,
             )
         return self._disp_jit_cache[key]
 
@@ -855,6 +880,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         scales,
         indices,
         packed_recv_x=None,
+        recv_cap=None,
     ):
         """Intranode dispatch. Launch geometry is resolved from cfg:
         cfg.dispatch_block_num/warp (user-pinned) > tuning table > default."""
@@ -862,6 +888,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cfg = self.cfg
         d_dtype = input.dtype
         inp_cur_tok = input.shape[0]
+        _recv_cap = self._resolve_recv_cap(recv_cap, "dispatch()")
         bn, wpb = _resolve_launch_geometry(
             "dispatch",
             cfg.dispatch_block_num,
@@ -872,7 +899,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             _DEFAULT_DISPATCH_WARP_NUM,
         )
         _check_block_num_resident("dispatch", bn)
-        disp_key = (d_dtype, bn, wpb)
+        disp_key = (d_dtype, bn, wpb, _recv_cap)
         self._last_inp_cur_tok = inp_cur_tok
         stream = torch.cuda.current_stream()
         inp_c = input if input.is_contiguous() else input.contiguous()
@@ -888,6 +915,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
 
         if cfg.enable_std_moe:
             self.packed_recv_count.zero_()
+        # The dispatch kernel accumulates into total_recv. Reset it here so
+        # dispatch is self-contained even when a prior combine did not run.
+        self.total_recv.zero_()
 
         _std_args = (
             self._fx_out_tok,
@@ -900,7 +930,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_disp_grid_bar,
         )
 
-        disp_fn = self._get_dispatch_jit(d_dtype, bn, wpb)
+        disp_fn = self._get_dispatch_jit(d_dtype, bn, wpb, _recv_cap)
         disp_compiled = self._disp_compiled_cache.get(disp_key)
         if disp_compiled is None:
             args = (
@@ -951,7 +981,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 stream,
             )
 
-        mr = cfg.effective_max_recv
+        mr = _recv_cap
         k = cfg.num_experts_per_token
 
         out_token_bytes = _token_bytes_for(d_dtype, cfg.hidden_dim)
@@ -961,8 +991,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             .view(d_dtype)
             .view(mr, out_view_dim)
         )
-        out_wts = self.shmem_disp_out_wts.view(mr, k)
-        out_idx = self.shmem_disp_out_idx.view(mr, k)
+        out_wts = self.shmem_disp_out_wts[: mr * k].view(mr, k)
+        out_idx = self.shmem_disp_out_idx[: mr * k].view(mr, k)
         out_scales = None
         if cfg.scale_bytes > 0:
             out_scales = (
@@ -988,6 +1018,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         fp8_dc,
         block_num,
         warp_num_per_block,
+        recv_cap,
     ):
         """Lazy-jit a combine kernel specialized to the launch-time dtype/flags +
         geometry. Zero-copy hard-wires skip_stage1 (caller pre-staged)."""
@@ -998,6 +1029,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bool(fp8_dc),
             block_num,
             warp_num_per_block,
+            recv_cap,
         )
         if key not in self._comb_jit_cache:
             cfg = self.cfg
@@ -1017,7 +1049,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 # the regular combine() path never skips Stage 1.
                 skip_stage1=False,
                 fp8_direct_cast=bool(fp8_dc),
-                max_recv=self._effective_max_recv,
+                max_recv=recv_cap,
             )
         return self._comb_jit_cache[key], key
 
@@ -1028,6 +1060,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         indices,
         packed_recv_x=None,
         cur_tok=None,
+        recv_cap=None,
     ):
         """Intranode combine. ``input.dtype`` selects the kernel specialization.
         Zero-copy mode requires the caller to write into the buffer from
@@ -1036,6 +1069,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._check_combine_inputs(input, weights, indices, packed_recv_x)
         cfg = self.cfg
         stream = torch.cuda.current_stream()
+        _recv_cap = self._resolve_recv_cap(recv_cap, "combine()")
 
         c_dtype = input.dtype
         zero_copy = cfg.zero_copy
@@ -1107,7 +1141,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         )
 
         comb_fn, comb_key = self._get_combine_jit(
-            c_dtype, zero_copy, enable_weights_flag, fp8_dc, bn, wpb
+            c_dtype,
+            zero_copy,
+            enable_weights_flag,
+            fp8_dc,
+            bn,
+            wpb,
+            _recv_cap,
         )
         comb_compiled = self._comb_compiled_cache.get(comb_key)
         if comb_compiled is None:
