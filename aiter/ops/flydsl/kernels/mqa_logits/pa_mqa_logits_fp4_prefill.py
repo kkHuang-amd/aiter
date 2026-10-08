@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
@@ -364,8 +364,11 @@ def build_pa_mqa_logits_fp4_prefill_module(
     num_warps=DEFAULT_NUM_WARPS,
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
+    out_bf16=False,
 ):
-    """Build the ragged-prefill FP4 MQA logits kernel."""
+    """Build the ragged-prefill FP4 MQA logits kernel. out_bf16 stores the logits as bf16
+    (rounded from the fp32 sum) instead of fp32."""
+    out_bytes = 2 if out_bf16 else 4
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
@@ -510,20 +513,22 @@ def build_pa_mqa_logits_fp4_prefill_module(
         out_win = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.recast_iter(
-                    fx.PointerType.get(T.f32, out_logits_ptr.memspace, 4),
+                    fx.PointerType.get(T.bf16 if out_bf16 else T.f32, out_logits_ptr.memspace, out_bytes),
                     fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems),
                 ),
                 fx.make_layout((win_len, 1), (1, 1)),
             ),
             max_size=False,
-            num_records_bytes=win_len * fx.Int32(4),
+            num_records_bytes=win_len * fx.Int32(out_bytes),
         )
         out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
             fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
         )
-        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
+        out_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy16b() if out_bf16 else fx.rocdl.BufferCopy32b(), 1
+        )
         out_reg_ty = fx.MemRefType.get(
-            T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+            T.bf16 if out_bf16 else T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
         )
         out_reg_lay = fx.make_layout(1, 1)
 
@@ -713,7 +718,12 @@ def build_pa_mqa_logits_fp4_prefill_module(
             # tested here. Cells outside stay at the caller's -inf pre-fill.
             r_out = fx.memref_alloca(out_reg_ty, out_reg_lay)
             fx.memref_store_vec(
-                fx.Vector.from_elements([thread_sum], dtype=fx.Float32), r_out
+                (
+                    fx.Vector.from_elements([thread_sum.to(fx.BFloat16)], dtype=fx.BFloat16)
+                    if out_bf16
+                    else fx.Vector.from_elements([thread_sum], dtype=fx.Float32)
+                ),
+                r_out,
             )
             fx.copy(
                 out_atom,
@@ -826,7 +836,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 # ============================================================================
 
 
-@lru_cache(maxsize=32)
+@cache
 def compile_pa_mqa_logits_fp4_prefill(
     *,
     block_k: int = 256,
@@ -835,6 +845,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
+    out_bf16: bool = False,
 ):
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
@@ -843,6 +854,7 @@ def compile_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
+        out_bf16=out_bf16,
     )
 
     @flyc.jit
@@ -917,6 +929,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         )
     elif schedule_internal:
         out.fill_(float("-inf"))
+    assert out.dtype in (torch.float32, torch.bfloat16), out.dtype
 
     launcher, _ = compile_pa_mqa_logits_fp4_prefill(
         block_k=block_k,
@@ -925,6 +938,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
+        out_bf16=out.dtype == torch.bfloat16,
     )
 
     if stream is None:
