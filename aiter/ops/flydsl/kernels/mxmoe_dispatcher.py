@@ -856,9 +856,7 @@ def mxfp4_moe_gemm2(
             f"D_INTER (K) must be a multiple of BK ({BK}), got {D_INTER}"
         )
     if D_HIDDEN > HIDDEN_MAX:
-        raise AssertionError(
-            f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
-        )
+        HIDDEN_MAX = -(-D_HIDDEN // 8192) * 8192
     if str(out_dtype).strip().lower() == "fp4":
         if epilog != "scatter":
             raise AssertionError(

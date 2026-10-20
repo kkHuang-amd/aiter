@@ -608,13 +608,12 @@ def v2_stage1_sorted_ref(
     out = torch.zeros((max_sorted, inter_dim), dtype=torch.bfloat16, device=ref1.device)
     tok_of = sti[:n] & 0x00FFFFFF
     rows = (tok_of < token).nonzero(as_tuple=True)[0]
-    for r in rows.tolist():
-        t = int(tok_of[r].item())
-        e = int(sei[r // bm_s1].item())
-        slot = (topk_ids[t] == e).nonzero(as_tuple=True)[0]
-        if slot.numel() == 0:
-            continue
-        out[r] = ref1[t, int(slot[0].item())].to(torch.bfloat16)
+    t = tok_of[rows].long()
+    e = sei[rows // bm_s1].to(topk_ids.dtype)
+    match = topk_ids[t] == e[:, None]
+    has = match.any(dim=1)
+    slot = match.int().argmax(dim=1)
+    out[rows[has]] = ref1[t[has], slot[has]].to(torch.bfloat16)
     return out
 
 

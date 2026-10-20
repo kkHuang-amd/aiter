@@ -113,6 +113,11 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+# Expert-parallel runtime (expert_mask) forces stage2 to accumulate into [M, model_dim],
+# so only atomic stage2 kernels are valid candidates for EP shapes.
+TUNE_MOE_STAGE2_ATOMIC_ONLY = (
+    os.environ.get("TUNE_MOE_STAGE2_ATOMIC_ONLY", "False").lower() == "true"
+)
 
 COS_DIFF_THRESHOLD = 1e-1
 
@@ -3893,6 +3898,8 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
+                if TUNE_MOE_STAGE2_ATOMIC_ONLY and "_atomic" not in kname:
+                    continue
                 s2_tile_m = kparams["tile_m"]
                 if blockM % s2_tile_m != 0:
                     continue
@@ -4146,6 +4153,8 @@ class FmoeTuner(TunerCommon):
                 model_dim=model_dim,
                 inter_dim=inter_dim,
             ).items():
+                if TUNE_MOE_STAGE2_ATOMIC_ONLY and "_atomic" not in kn2:
+                    continue
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
                 tasks.append(
