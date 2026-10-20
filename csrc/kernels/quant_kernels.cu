@@ -2688,9 +2688,14 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     {                                                                                          \
         FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                            \
     }                                                                                          \
+    else if(cols_ <= 32 * BlockSize * 2)                                                       \
+    {                                                                                          \
+        /* one 32-wide group per thread; the kernel has no block-level reduction */            \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize * 2)                        \
+    }                                                                                          \
     else                                                                                       \
     {                                                                                          \
-        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 64 * BlockSize);  \
     }
 
 static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,

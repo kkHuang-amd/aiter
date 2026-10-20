@@ -1169,7 +1169,7 @@ def fused_dynamic_mx_quant_moe_sort(
         (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
         or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * eff_topk)
         or group_size != 32
-    ) and (N <= 8192 or group_size != 32)  # proxy_moe_sglang: fused kernel supports cols <= 8192
+    ) and (N <= 16384 or group_size != 32)  # fused kernel supports cols <= 16384
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
         common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
