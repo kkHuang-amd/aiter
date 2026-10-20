@@ -26,6 +26,16 @@ def load_hip_runtime() -> ctypes.CDLL:
     LD_LIBRARY_PATH at runtime. Try the plain name first, then versioned
     sonames so it works regardless of which package is present.
     """
+    # Reuse the runtime this process already loaded (torch's): a second copy, e.g.
+    # the unversioned name resolving into another rocm-sdk package, has its own
+    # pointer table, so hipIpcGetMemHandle on torch allocations fails there.
+    try:
+        with open("/proc/self/maps") as f:
+            loaded = sorted({ln.split()[-1] for ln in f if "/libamdhip64.so" in ln})
+        if len(loaded) == 1:
+            return ctypes.CDLL(loaded[0])
+    except OSError:
+        pass
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
     last_err = None
     for name in candidates:
