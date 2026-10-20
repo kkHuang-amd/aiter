@@ -515,7 +515,7 @@ def build_communication(kc: KernelCtx) -> dict:
         sidx = bid // m
         own = i32(0)
         for c in range_constexpr(NV):
-            own = own | ((i32(c) % S) == sidx).select(i32(1 << c), i32(0))
+            own = own | ((i32(c) % S) == sidx).select(i32((1 << c) - (1 << 32) if c == 31 else 1 << c), i32(0))
         return (bid < m * S).select(own, i32(0))
 
     def recv_pkts(a, r_recv, row, rstride, c0, vc):
@@ -710,6 +710,8 @@ def build_communication(kc: KernelCtx) -> dict:
         return (some.select(i32(0), i32(1)) == i32(1)) & (fin_owned(a) == i32(0))
 
     VMASK = (1 << NV) - 1
+    # i32 view of VMASK: NV == 32 needs the two's-complement value (-1)
+    VMASK32 = VMASK - (1 << 32) if NV == 32 else VMASK
 
     def _lowest(v):
         return _ctpop((v & (i32(0) - v)) - i32(1))
@@ -721,7 +723,7 @@ def build_communication(kc: KernelCtx) -> dict:
         avail = (
             lds_ld_acq(L, L_CTL + rdy_off * 4)
             & (lds_ld_acq(L, L_CTL + bits_off * 4) ^ i32(-1))
-            & i32(VMASK)
+            & i32(VMASK32)
         )
         if (n < i32(NV)) & (avail != i32(0)):
             c = _lowest(avail)
@@ -772,7 +774,7 @@ def build_communication(kc: KernelCtx) -> dict:
         )
 
     def _comm_pending(L):
-        full = i32(VMASK)
+        full = i32(VMASK32)
         push = (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NV)) & (
             (lds_ld_acq(L, L_CTL + C_PRDY * 4) & full) != full
         )

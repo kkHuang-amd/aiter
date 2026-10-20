@@ -95,7 +95,7 @@ def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool
         model_dim % 512 == 0
         and (model_dim // 64) % NW == 0
         and model_dim // 256 <= NCHA_MAX
-        and model_dim // 256 // gemm2_chunk_groups(model_dim, inter_dim) <= 31
+        and model_dim // 256 // gemm2_chunk_groups(model_dim, inter_dim) <= 32
         and inter_dim % 128 == 0
         and inter_dim >= 256
         and 1 <= tp <= MAX_TP
@@ -193,7 +193,7 @@ def mega_moe_tp_consts(
     assert KS1 % NSK == 0 and NSK % KCS == 0
     assert (NSK - 1) * OPS <= 63 and c["NA_L"] * (max(ALOAD_DEPTH, nab) - 1) <= 63
     assert not lb or RG <= 256
-    assert c["NCK"] <= NCK_MAX and c["NCK"] <= 31
+    assert c["NCK"] <= NCK_MAX and c["NCK"] <= 32
     return c
 
 
