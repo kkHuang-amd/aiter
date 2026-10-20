@@ -3179,7 +3179,8 @@ def compile_mixed_moe_gemm2_common(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
-    del b_nt
+    # b_nt: buffer cache policy of the B (weight) loads, as named by the kernel's
+    # `_bnt{b_nt}` suffix (2 = streaming; decode reads each expert's W2 once).
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -3328,14 +3329,28 @@ def compile_mixed_moe_gemm2_common(
     persistent = persist_m <= 0
     if const_expr(not isinstance(cu_num_mul, int) or cu_num_mul < 1):
         raise ValueError(f"cu_num_mul must be int >= 1, got {cu_num_mul}")
+    # D2 experiment: AITER_D2_STREAM_K=k flattens (m-block, n-tile) items over
+    # cu_num * k persistent WGs, each taking a contiguous item range.
+    import os as _os
+
+    stream_k = int(_os.environ.get("AITER_D2_STREAM_K", "0")) if persistent else 0
     if const_expr(persistent):
         from aiter.jit.utils.chip_info import get_cu_num
 
-        cu_num = get_cu_num() * int(cu_num_mul)
+        cu_num = get_cu_num() * int(cu_num_mul) * max(stream_k, 1)
     else:
         cu_num = 0
     sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     pm_tag = f"_persist_cu{cu_num}" if persistent else f"_pm{persist_m}"
+    if stream_k:
+        pm_tag += "_stream2"
+    # D2 experiment: issue the first B / scale loads before the sorted-token-id
+    # LDS prologue (A rows are in sorted order; token ids are only used by the epilogue).
+    d2_defer_tid = _os.environ.get("AITER_D2_DEFER_TID", "0") == "1"
+    if d2_defer_tid:
+        pm_tag += "_dtid"
+    if b_nt:
+        pm_tag += f"_bnt{b_nt}"
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu is not None else ""
     if const_expr(waves_per_eu is not None and not (1 <= int(waves_per_eu) <= 10)):
         raise ValueError(f"waves_per_eu must be in [1, 10] or None, got {waves_per_eu}")
@@ -3621,11 +3636,34 @@ def compile_mixed_moe_gemm2_common(
                 c_tm_p = arith.constant(tile_m, index=True)
                 _num_valid_idx = fx.Index(num_valid_i32)
                 total_m_tiles = (_num_valid_idx + c_tm_p - c1_p) // c_tm_p
+                if const_expr(stream_k > 0):
+                    c_tn_s = arith.constant(tile_n, index=True)
+                    n_tiles_s = (
+                        n_in - arith.constant(model_dim_pad, index=True) + c_tn_s - c1_p
+                    ) // c_tn_s
+                    total_items_s = total_m_tiles * n_tiles_s
+                    wg_s = fx.Index(by_outer)
+                    item_lo_s = wg_s * total_items_s // c_cu
+                    item_hi_s = (wg_s + c1_p) * total_items_s // c_cu
                 tiles_per_block_base = total_m_tiles // c_cu
                 tiles_remainder = total_m_tiles - (tiles_per_block_base * c_cu)
                 has_extra_tile = fx.Index(bx_persist) < fx.Index(tiles_remainder)
                 extra_tile = has_extra_tile.select(c1_p, c0_p)
                 tiles_per_block = tiles_per_block_base + extra_tile
+                if const_expr(stream_k > 0):
+                    tiles_per_block = item_hi_s - item_lo_s
+
+                    def _stream_meta(item):
+                        # (expert id, first sorted token) of item's m-block; carried
+                        # one item ahead so B loads need not wait on them.
+                        bxm = (item // n_tiles_s) * arith.constant(tile_m, index=True)
+                        e = buffer_ops.buffer_load(
+                            expert_rsrc, _div_pow2(bxm, _sort_block_m), vec_width=1, dtype=T.i32
+                        )
+                        t = buffer_ops.buffer_load(sorted_rsrc, bxm, vec_width=1, dtype=T.i32)
+                        return e, t
+
+                    init_pf_expert, init_pf_tok = _stream_meta(item_lo_s)
                 start_tail = has_extra_tile.select(bx_persist, tiles_remainder)
                 persist_start_tile = bx_persist * tiles_per_block_base + start_tail
                 i1 = ir.IntegerType.get_signless(1)
@@ -3897,6 +3935,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
                         )
                         b_i64x2 = fx.Vector(b16).bitcast(i64_t)
                         return (
@@ -4467,7 +4506,7 @@ def compile_mixed_moe_gemm2_common(
                 )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
                 tid_in_range = fx.Index(tx) < fx.Index(c_tile_m_idx)
-                r216_defer_tid = bool(
+                r216_defer_tid = d2_defer_tid or bool(
                     r139_xdma_first
                     and use_async_copy
                     and int(tile_m) == 64
@@ -5020,12 +5059,20 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     moe_gemm2_then_body()
 
-            def _persist_setup(mi_p, prev_expert_i32=None, prev_expert_b_base=None):
+            pf_next = None
+
+            def _persist_setup(
+                mi_p, prev_expert_i32=None, prev_expert_b_base=None, pf_cur=None
+            ):
                 nonlocal bx, bx_m, bx_m_i32, blk_valid, sort_blk
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
                 nonlocal expert_b_base, first_tok, first_tid, tile_has_tokens
-                nonlocal tokens_i32_guard, m_scale_shift_i32
-                if const_expr(persistent):
+                nonlocal tokens_i32_guard, m_scale_shift_i32, by, pf_next
+                if const_expr(stream_k > 0):
+                    item_s = item_lo_s + mi_p
+                    bx = item_s // n_tiles_s
+                    by = item_s % n_tiles_s
+                elif const_expr(persistent):
                     bx = persist_start_tile + mi_p
                 else:
                     bx = bx_persist * arith.constant(persist_m, index=True) + mi_p
@@ -5033,9 +5080,13 @@ def compile_mixed_moe_gemm2_common(
                 bx_m_i32 = fx.Int32(bx_m)
                 blk_valid = (fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)).ir_value()
                 sort_blk = _div_pow2(bx_m, _sort_block_m)
-                expert_i32 = buffer_ops.buffer_load(
-                    expert_rsrc, sort_blk, vec_width=1, dtype=T.i32
-                )
+                if const_expr(stream_k > 0):
+                    expert_i32 = pf_cur[0]
+                    pf_next = _stream_meta(item_s + c1_p)
+                else:
+                    expert_i32 = buffer_ops.buffer_load(
+                        expert_rsrc, sort_blk, vec_width=1, dtype=T.i32
+                    )
                 expert_idx = fx.Index(expert_i32)
                 exp_valid = (fx.Uint32(expert_i32) < fx.Uint32(experts)).ir_value()
                 if const_expr(heterogeneous_b):
@@ -5053,9 +5104,12 @@ def compile_mixed_moe_gemm2_common(
                         expert_b_stride, index=True
                     )
                     expert_b_base = prev_expert_b_base + delta_b
-                first_tok = buffer_ops.buffer_load(
-                    sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
-                )
+                if const_expr(stream_k > 0):
+                    first_tok = pf_cur[1]
+                else:
+                    first_tok = buffer_ops.buffer_load(
+                        sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
+                    )
                 first_tid = fx.Int32(first_tok) & fx.Int32(0xFFFFFF)
                 tokens_i32_guard = fx.Int32(tokens_in)
                 tile_has_tokens = (
@@ -5069,13 +5123,19 @@ def compile_mixed_moe_gemm2_common(
 
             # The persistent variant carries "still active"; the other carries the
             # previous expert and its B base, to rebase by the expert delta.
-            if const_expr(persistent):
+            if const_expr(stream_k > 0):
+                loop_end = tiles_per_block
+                loop_init = [init_active, init_pf_expert, init_pf_tok]
+            elif const_expr(persistent):
                 loop_end, loop_init = tiles_per_block, [init_active]
             else:
                 loop_end, loop_init = c_pm, [init_prev_expert, init_prev_b_base]
 
             def _persist_iter(mi_p, state):
-                _persist_setup(mi_p, *([] if persistent else [state[0], state[1]]))
+                if const_expr(stream_k > 0):
+                    _persist_setup(mi_p, pf_cur=(state[1], state[2]))
+                else:
+                    _persist_setup(mi_p, *([] if persistent else [state[0], state[1]]))
                 if const_expr(persistent):
                     cur_active = arith.andi(state[0], blk_valid)
                     guard = arith.andi(
@@ -5093,6 +5153,8 @@ def compile_mixed_moe_gemm2_common(
 
                 _gemm2_valid_dispatch()
                 gpu.barrier()
+                if const_expr(stream_k > 0):
+                    return [cur_active, pf_next[0], pf_next[1]]
                 return [cur_active] if persistent else [expert_i32, expert_b_base]
 
             @flyc.jit
@@ -5240,7 +5302,10 @@ def compile_mixed_moe_gemm2_common(
         gx = (
             n_in - model_dim_pad_idx + tile_n_idx - arith.constant(1, index=True)
         ) // tile_n_idx
-        if const_expr(persistent):
+        if const_expr(stream_k > 0):
+            gx = arith.constant(cu_num, index=True)
+            gy = arith.constant(1, index=True)
+        elif const_expr(persistent):
             gy = arith.constant(cu_num, index=True)
         else:
             c_pm_l = arith.constant(persist_m, index=True)
