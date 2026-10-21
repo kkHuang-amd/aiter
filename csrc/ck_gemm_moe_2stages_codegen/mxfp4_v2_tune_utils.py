@@ -74,12 +74,21 @@ def quant_w(w, b_dtype):
     return quant_w_fp4(w)
 
 
-def dequant_w(q, scale, b_dtype, rows, cols):
-    values = q.float() if b_dtype == "fp8" else fp4_utils.mxfp4_to_f32(q)
-    scale_f32 = fp4_utils.e8m0_to_f32(scale)
-    return (
-        values.view(rows, cols // 32, 32) * scale_f32.view(rows, cols // 32, 1)
-    ).view(rows, cols)
+def dequant_w(q, scale, b_dtype, rows, cols, out_dtype=torch.float32, chunk_rows=8192):
+    # Row chunks keep the fp32 intermediate small: a full fp32 copy of all experts'
+    # weights (e.g. 512 x 2048 x 16384 = 64 GiB) does not fit next to the operands.
+    q2 = q.view(rows, -1)
+    s2 = scale.view(rows, -1)
+    out = torch.empty((rows, cols), dtype=out_dtype, device=q.device)
+    for r0 in range(0, rows, chunk_rows):
+        r1 = min(rows, r0 + chunk_rows)
+        qc = q2[r0:r1]
+        values = qc.float() if b_dtype == "fp8" else fp4_utils.mxfp4_to_f32(qc)
+        scale_f32 = fp4_utils.e8m0_to_f32(s2[r0:r1])
+        out[r0:r1] = (
+            values.view(r1 - r0, cols // 32, 32) * scale_f32.view(r1 - r0, cols // 32, 1)
+        ).view(r1 - r0, cols)
+    return out
 
 
 def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
@@ -273,14 +282,12 @@ def gen(
     # torch reference stage1 (dequant the SAME quantized operands the kernels read)
     a_deq = _a_deq(a1_qt, a1_scale, token, model_dim, adtype)
     w1_deq = (
-        dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim)
+        dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim, dtypes.bf16)
         .view(E, inter_dim * 2, model_dim)
-        .to(dtypes.bf16)
     )
     w2_deq = (
-        dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim)
+        dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim, dtypes.bf16)
         .view(E, model_dim, inter_dim)
-        .to(dtypes.bf16)
     )
     ref1 = torch_moe_stage1(
         a_deq,
