@@ -2114,5 +2114,36 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_mla_prefill_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_prefill_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a16w16_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_traits.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_traits.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_split.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "flags_extra_hip_per_source": {
+            "*opus_mla_prefill_fwd.cu": [
+                "-mllvm -amdgpu-early-inline-all=false"
+            ]
+        },
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }
